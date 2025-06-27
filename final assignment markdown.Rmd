@@ -1,0 +1,1163 @@
+---
+title: "finalproject"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-06-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## LOaD packages
+
+```{r }
+require(haven)
+require(foreign)  # for loading spss data
+require(sandwich)  # for robust standard errors
+require(lme4)      # for multilevel analysis library(lmerTest)  # for posttests
+require(lmtest)    # for robust standard errors and likelihood ratio tests
+library(dplyr)
+library(psych) # for descriptives
+library(quest) # for descriptives of multi-level data
+library(mlmhelpr) # for multi-level applications
+library(ggplot2) # for plotting
+require(stargazer) # for making nice tables
+library(lmerTest) # for conducting post estimation test on ml models
+library(performance) # for R2 calculation
+library(lattice) # for plotting
+library(plm) # for fixed effect models
+library(tidyr) # tranforming data from wide to long and vice versa
+library(broom.mixed) # for tidy() on mixed models
+library(sjPlot)
+pequiv <- readRDS("C:/Users/noaha/AppData/Local/Temp/fe870aea-e78e-46ec-9dd1-8757510678f3_SOEP-CORE.v39eu_R_EN.zip.8f3/R_EN/soepdata/pequiv.rds")
+```
+
+## Create Subset with relevant variables
+
+```{r}
+#pequiv$happiness <- pequiv$p11101
+#pequiv$workhrs <- pequiv$e11101
+#pequiv$employmentstatus <- pequiv$e11102
+#pequiv$netincome <- pequiv$i11102
+#pequiv$race <- pequiv$d11112ll
+#pequiv$was_in_hospital <- pequiv$m11101
+#pequiv$age <-pequiv$d11101
+#d11109 years of education
+#occupation e11105_v1
+#m11126	Current Self-Rated Health Status
+#x11101ll	Person Identification Number
+#pid	Never Changing Person ID
+#syear	Survey Year
+#d11101	Age of Individual
+#d11102ll	Gender of Individual
+#cid	Original HH Number
+#hid	Current Wave HH Number
+#d11106	Number of Persons in HH
+#d11107	Number of Children in HH
+#d11104	Marital Status of Individual
+#l11101	State of Residence
+#e11103 employment level 
+
+vars <- c(
+  # Original core variables
+  "d11109",        # Years of education
+  "m11126",        # Self-rated health
+  "pid",           # Person ID (stable)
+  "syear",         # Year
+  "d11101",        # Age
+  "d11102ll",      # Gender
+  "cid",           # Original household ID
+  "hid",           # Current wave household ID
+  "d11106",        # Household size
+  "d11107",        # Number of children
+  "d11104",        # Marital status
+  "e11103",        #employment level
+  "i11110",        #individual labor earnings
+  "p11101",        # Happiness
+  "e11102",        # Employment status
+  "i11102",        # HH Net income
+  "m11101"         # Was in hospital
+)
+
+#create subset
+pequiv_subset <- pequiv[, vars]
+
+#rename variables
+pequiv_subset <- pequiv_subset %>%
+  rename(
+    education = d11109,
+    health = m11126,
+    pid = pid,
+    year = syear,
+    age = d11101,
+    gender = d11102ll,
+    hh_orig = cid,
+    hh_wave = hid,
+    hh_size = d11106,
+    hh_kids = d11107,
+    marital_status = d11104,
+    happiness = p11101,
+    employmentstatus = e11102,
+    hhnetincome = i11102,
+    was_in_hospital = m11101,
+    employmentlvl = e11103,        #employment level
+   indiv_wage =i11110       #individual labor earnings
+  )
+
+```
+
+## Inspect Dataset
+```{r}
+str(pequiv_subset)
+
+summary(pequiv_subset$happiness)
+table(pequiv_subset$happiness)
+summary(pequiv_subset$employmentstatus)
+table(pequiv_subset$gender, useNA = "ifany")
+table(pequiv_subset$occupation, useNA = "ifany")
+
+attr(pequiv_subset$gender, "labels")
+
+attr(pequiv_subset$marital_status, "labels")
+```
+
+
+## Data handling
+Prepare data for analysis
+```{r}
+#all non-answers recoded to NA
+pequiv_subset[] <- lapply(pequiv_subset, function(x) {
+  if (is.numeric(x) || is.integer(x)) {
+    x[x %in% -1:-8] <- NA
+  }
+  return(x)
+})
+
+
+#check
+table(pequiv_subset$gender, useNA = "ifany")
+
+#recode gender to new female variable with 0 male and 1 for female
+pequiv_subset <- pequiv_subset %>%
+  mutate(female = case_when(
+    gender == 1 ~ 0,  # Male
+    gender == 2 ~ 1,  # Female
+    TRUE ~ NA_real_
+  ))
+table(pequiv_subset$female, useNA = "ifany")
+
+
+pequiv_subset <- pequiv_subset %>%
+  mutate(
+    married = ifelse(marital_status == 1, 1, 0)
+  )
+
+#more preprocessing
+#only core working age group
+pequiv_subset <- pequiv_subset %>%
+  filter(age >= 30, age <= 49)
+
+
+
+#only beyond 2002 (less attrition more consistent survey questions)
+pequiv_subset <- pequiv_subset %>%
+  filter(year >= 2002, year <= 2020)
+table(pequiv_subset$year, useNA = "ifany")
+
+
+```
+##more pre-processing
+```{r}
+
+
+#create income log
+pequiv_subset$log_hhincome <- log1p(pequiv_subset$hhnetincome)
+
+
+
+
+#create OECD equivalence scale for income
+pequiv_subset <- pequiv_subset %>%
+  mutate(eq_income = hhnetincome / sqrt(hh_size),
+         log_eq_income = log1p(eq_income))  # if skewed
+
+
+
+
+
+```
+
+##check and handle missings
+```{r}
+
+colSums(is.na(pequiv_subset))
+#significant missings:  health 18,000 ; married 18806 ; happiness 19397  ; hhnetincome 5721
+
+
+
+# Visual check: does X differ by missingness in happiness?
+
+# Income
+ggplot(pequiv_subset, aes(x = is.na(happiness), y = log_eq_income)) +
+  geom_boxplot() +
+  labs(x = "Missing happiness?", y = "Log Household Income",
+       title = "Does income differ between missing and non-missing happiness?")
+
+# Employment status
+ggplot(pequiv_subset, aes(x = factor(employmentstatus), fill = is.na(happiness))) +
+  geom_bar(position = "fill") +
+  labs(x = "Employment Status", y = "Proportion",
+       fill = "Missing happiness?",
+       title = "Does employment status relate to missing happiness?")
+
+#health
+ggplot(pequiv_subset, aes(x = is.na(happiness), y = health)) +
+  geom_boxplot() +
+  labs(x = "Missing happiness?", y = "Health",
+       title = "Does health differ between missing and non-missing happiness?")
+
+# Married
+ggplot(pequiv_subset, aes(x = factor(married), fill = is.na(happiness))) +
+  geom_bar(position = "fill") +
+  labs(x = "Married", y = "Proportion",
+       fill = "Missing happiness?",
+       title = "Does marriage status relate to missing happiness?")
+
+# Gender
+ggplot(pequiv_subset, aes(x = factor(female), fill = is.na(happiness))) +
+  geom_bar(position = "fill") +
+  labs(x = "Gender", y = "Proportion",
+       fill = "Missing happiness?",
+       title = "Does gender relate to missing happiness?")
+
+
+
+#remove incomplete observations on key variables
+pequiv_subset <- pequiv_subset %>%
+  filter(!is.na(health), !is.na(employmentstatus), !is.na(female), !is.na(happiness), !is.na(hhnetincome), !is.na(married))
+
+```
+##create income brackets and check 
+```{r}
+
+#create income per hh member brackets and calc mean happiness
+pequiv_subset <- pequiv_subset %>%
+  filter(!is.na(happiness), !is.na(hhnetincome)) %>%
+  mutate(income_bracket2 = cut(
+    eq_income,
+    breaks = c(0, 15000, 30000, 45000, 70000, 120000, Inf),
+    labels = c("1", "2", "3", "4", "5", "6"),
+    right = FALSE  # bracket includes lower bound, excludes upper
+  ))
+mean_happiness_by_bracket <- pequiv_subset %>%
+  group_by(income_bracket2) %>%
+  summarise(
+    n = n(),
+    mean_happiness = mean(happiness, na.rm = TRUE)
+  )
+
+print(mean_happiness_by_bracket)
+```
+
+
+##check descriptives of variables of interest
+```{r}
+mean(pequiv_subset$happiness)
+sd((pequiv_subset$happiness))
+psych::describe(pequiv_subset$happiness)
+
+table(pequiv_subset$employmentstatus)
+
+```
+
+
+## More data preprocessing
+```{r}
+#check number of ppl in dataset
+length(unique(pequiv_subset$pid))
+
+#check some correlations
+cor(pequiv_subset$health, log1p(pequiv_subset$hhnetincome), use = "complete.obs")
+
+cor(pequiv_subset$health, pequiv_subset$happiness, use = "complete.obs")
+attr(pequiv_subset$health, "labels")
+cor(pequiv_subset$health, pequiv_subset$employmentstatus, use = "complete.obs")
+cor(pequiv_subset$happiness, pequiv_subset$employmentstatus, use = "complete.obs")
+cor(pequiv_subset$happiness, pequiv_subset$hhnetincome, use = "complete.obs")
+cor(pequiv_subset$health, pequiv_subset$age, use = "complete.obs")
+cor(pequiv_subset$gender, pequiv_subset$hhnetincome, use = "complete.obs")
+cor(pequiv_subset$happiness, pequiv_subset$year, use = "complete.obs")
+cor(pequiv_subset$happiness, pequiv_subset$marital_status, use = "complete.obs")
+attr(pequiv_subset$marital_status, "labels")
+cor(pequiv_subset$happiness, log1p(pequiv_subset$hhnetincome), use = "complete.obs")
+
+#try to plot log income over happiness
+set.seed(123)  # for reproducibility
+
+plot_data <- pequiv_subset %>%
+  filter(!is.na(happiness), !is.na(hhnetincome)) %>%
+  sample_n(5000)  # adjust sample size as needed
+
+ggplot(plot_data, aes(x = log1p(hhnetincome), y = happiness)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", color = "darkgreen") +
+  labs(
+    title = "Happiness vs. log1p(Income)",
+    x = "log(Income + 1)",
+    y = "Happiness"
+  )
+
+```
+
+
+
+#center and standardize some variables
+```{r}
+
+pequiv_subset <- pequiv_subset %>%
+  mutate(
+    # Center age around median
+    age_c = age - median(age, na.rm = TRUE),
+    
+    # Time variable: years since 2002
+    baseyear = year - 2002,
+    
+    # Standardized log household income
+    log_eq_income_z = as.numeric(scale(log_eq_income)),
+    
+    # Number of children in household, centered around median
+    hh_kids_c = hh_kids - median(hh_kids, na.rm = TRUE),
+    
+    # Household size centered around median
+    hh_size_c = hh_size - median(hh_size, na.rm = TRUE),
+    
+    # Happiness centered around median
+    happiness_c = happiness - median(happiness, na.rm = TRUE),
+    
+    # Health centered around median
+    health_c = health - median(health, na.rm = TRUE)
+    
+    
+  )
+
+```
+## create health lag
+```{r}
+# Create lagged health variable where the first observation per pid is retained
+pequiv_subset <- pequiv_subset %>%
+  arrange(pid, year) %>%
+  group_by(pid) %>%
+  mutate(
+    health_lag = dplyr::lag(health),
+    health_lag = if_else(row_number() == 1, health, health_lag)
+  ) %>%
+  ungroup()
+
+# View side-by-side for a sample of individuals
+pequiv_subset %>%
+  filter(pid %in% sample(unique(pid), 10)) %>%
+  dplyr::select(pid, year, health, health_lag) %>%
+  arrange(pid, year)
+
+
+```
+
+
+###create descriptive table of key variables
+```{r}
+
+# key variables
+desc_vars <- pequiv_subset %>%
+  select(
+    happiness,
+    eq_income,
+    log_eq_income,
+    employmentstatus,
+    female,
+    married,
+    baseyear,
+    health_lag
+  )
+
+# Create descriptive statistics table
+descriptives <- psych::describe(desc_vars)
+
+# Print nicely for copy-paste
+round(descriptives[, c("mean", "sd", "min", "max", "n")], 2)
+
+```
+
+
+#plot happiness by employmentstatus
+```{r}
+pequiv_subset %>%
+  group_by(employmentstatus) %>%
+  summarise(mean_happiness = mean(happiness, na.rm = TRUE),
+            n = n())
+
+happiness_summary <- pequiv_subset %>%
+  filter(employmentstatus %in% c(0, 1)) %>%  # exclude NAs or other values
+  group_by(employmentstatus) %>%
+  summarise(avg_happiness = mean(happiness, na.rm = TRUE)) %>%
+  mutate(
+    employment_mean = if_else(employmentstatus == 1, "Employed", "Unemployed")
+  )
+
+pequiv_subset %>%
+  filter(employmentstatus %in% c(0, 1)) %>%
+  mutate(employment_mean = if_else(employmentstatus == 1, "Employed", "Unemployed")) %>%
+  ggplot(aes(x = happiness, fill = employment_mean)) +
+  geom_histogram(position = "identity", alpha = 0.6, bins = 20) +
+  labs(title = "Distribution of Happiness by Employment Status",
+       x = "Happiness",
+       y = "Count",
+       fill = "Employment Status") +
+  theme_minimal() + 
+  geom_vline(data = happiness_summary,
+             aes(xintercept = avg_happiness, color = employment_mean),
+             linetype = "dashed", size = 1)
+
+
+# Calculate mean happiness by employment status
+mean_happiness <- pequiv_subset %>%
+  group_by(employmentstatus) %>%
+  summarise(mean_happiness = mean(happiness, na.rm = TRUE))
+mean_happiness$employmentstatus <- as.factor(mean_happiness$employmentstatus)
+
+# Create the bar plot
+ggplot(mean_happiness, aes(x = employmentstatus, y = mean_happiness, fill = employmentstatus)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  scale_fill_manual(values = c("gray60", "gray80")) +
+  labs(title = "Mean Life Satisfaction by Employment Status",
+       x = "Employment Status",
+       y = "Mean Life Satisfaction") +
+  ylim(0, 10) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    text = element_text(size = 11)
+  )
+```
+
+
+```{r}
+hist(pequiv_subset$happiness)
+psych::describe(pequiv_subset$happiness)
+
+plot(pequiv_subset$hhnetincome)
+plot(pequiv_subset$log_hhincome)
+```
+
+
+
+
+
+
+#simple regression and robust standard errors
+
+
+#simple ols modes to compare
+
+```{r}
+ols1 <- lm(happiness ~ scale(log_eq_income) +  employmentstatus, data = pequiv_subset)
+summary(ols1)
+
+ols2 <- lm(happiness ~ scale(log_eq_income) + female*employmentstatus, data = pequiv_subset)
+summary(ols2)
+
+ols4 <- lm(happiness ~ scale(log_eq_income) + female*employmentstatus + scale(health_lag) + scale(baseyear) + married , data = pequiv_subset)
+summary(ols4)
+
+
+#ols2 <- lm(happiness ~ scale(log_hhincome) + relative_year +  relative_year2 +  female  + scale(health) + scale(baseyear) , data = pequiv_trans)
+#summary(ols2)
+
+psych::describe(pequiv_subset$hhnetincome)
+quantile(pequiv_subset$hhnetincome, probs = seq(0, 1, 0.1), na.rm = TRUE)
+
+pequiv_subset <- pequiv_subset %>%
+  mutate(income_bracket_num = as.integer(income_bracket2) - 1)
+table(pequiv_subset$income_bracket_num)
+
+ols12 <- lm(happiness ~ scale(income_bracket_num) , data = pequiv_subset)
+summary(ols12)
+
+ols10 <- lm(happiness ~ scale(income_bracket_num) +  female*employmentstatus + scale(health_lag) + scale(baseyear) + married , data = pequiv_subset)
+summary(ols10)
+
+```
+##create table with ols models and clustered se
+```{r}
+library(lmtest)
+library(sandwich)
+library(stargazer)
+
+# Clustered standard errors by pid
+cluster_se <- function(model, cluster_var) {
+  vcovCL(model, cluster = cluster_var, type = "HC1")
+}
+
+# Compute clustered SEs
+cl_ols1 <- cluster_se(ols1, ~pequiv_subset$pid)
+cl_ols2 <- cluster_se(ols2, ~pequiv_subset$pid)
+cl_ols4 <- cluster_se(ols4, ~pequiv_subset$pid)
+
+# Stargazer with clustered SEs
+stargazer(ols1, ols2, ols4,
+          se = list(sqrt(diag(cl_ols1)), sqrt(diag(cl_ols2)), sqrt(diag(cl_ols4))),
+          type = "text",  # or "text/ latex" / "html"
+          title = "OLS Models Predicting Happiness with Clustered SEs",
+          column.labels = c("OLS1", "OLS2", "OLS4"),
+          dep.var.labels = "Happiness",
+          no.space = TRUE,
+          digits = 3,
+          keep.stat = c("n", "rsq", "adj.rsq"))
+
+```
+
+
+
+
+##plot some random slopes
+```{r}
+library(dplyr)
+library(lme4)
+
+# Step 1: Sample 70 individuals
+set.seed(123)
+sampled_pids <- sample(unique(pequiv_subset$pid), 70)
+
+# Step 2: Subset and clean data
+d <- pequiv_subset %>%
+  filter(pid %in% sampled_pids) %>%
+  filter(!is.na(employmentstatus) & !is.na(happiness)) %>%
+  mutate(employmentstatus = as.numeric(employmentstatus))
+
+##  plot
+ggplot(d, aes(x = employmentstatus, y = happiness, group = pid)) +
+  geom_smooth(method = "lm", se = FALSE, aes(color = factor(pid))) +
+  labs(x = "Employment Status (0 = Unemployed, 1 = Employed)",
+       y = "Happiness",
+       color = "Individual (pid)",
+       title = "Individual OLS Regression Lines: Employment Status → Happiness") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+#plot individual regression lines to see whether the slopes vary across participants
+
+```{r}
+# Step 3: Plot individual OLS regression lines
+ggplot(d, aes(x = log_hhincome, y = happiness, group = pid)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, aes(color = factor(pid)), alpha = 0.5) +
+  labs(x = "Logged Household Income",
+       y = "Happiness",
+       color = "Individual (pid)",
+       title = "Individual OLS Regression Lines: Log Household Income → Happiness") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+
+##1 MUlti-level model: NUll model, Level 1, Level 2, random slopes, cross level interaction
+```{r}
+#null model
+mnull <- lmer(happiness ~ 1 + (1 | pid), data = pequiv_subset, REML = F)
+summary(mnull)
+#compute ICC
+icc_null <- icc(mnull)
+icc_null
+#about 53 percent of the variance is at the pid level
+
+#add key level 1 predictors
+ml1a <- lmer(happiness ~  scale(log_eq_income)
+                    + employmentstatus + (1 | pid),
+                 data = pequiv_subset, , REML = F)
+summary(ml1a)
+
+#Add lvl1 predictors
+ml1 <- lmer(happiness ~ scale(health_lag) + scale(log_eq_income) +  scale(baseyear) + married
+                    + employmentstatus + (1 | pid),
+                 data = pequiv_subset, , REML = F)
+summary(ml1)
+#add lvl2 predictors
+ml2 <- lmer(happiness ~ scale(health_lag) + scale(log_eq_income) +  scale(baseyear) + married
+                   + employmentstatus + female + (1 | pid),
+                 data = pequiv_subset, REML = F)
+summary(ml2)
+#add random slopes
+mrs <- lmer(happiness ~ scale(health_lag) + scale(log_eq_income) + scale(baseyear) + married
+                   +employmentstatus + female + (1 +employmentstatus | pid),
+                 data = pequiv_subset, REML = F)
+summary(mrs)
+#add cross-level interactions
+m_interaction_rs <- lmer(happiness ~ scale(health_lag) + scale(log_eq_income) + scale(baseyear) + married
+                               + employmentstatus * female +
+                               (1 + employmentstatus | pid),
+                             data = pequiv_subset,REML = F)
+
+#add cross-level interaction 2
+m_interaction2_rs <- lmer(happiness ~ scale(health_lag) + scale(log_eq_income)*female + scale(baseyear) + married
+                               + employmentstatus * female +
+                               (1 + employmentstatus | pid),
+                             data = pequiv_subset,REML = F)
+summary(m_interaction2_rs)
+###this imodel is not in the paper since changes in effects are negligeble, and the additional explained variance so small that it would only make the table less readable
+
+
+#check out final model
+summary(m_interaction_rs)
+
+#compute LRtests
+lrtest(ml1, mnull)
+lrtest(ml1a, mnull)
+lrtest(ml1, ml1a)
+lrtest(ml2, ml1)
+lrtest(mrs, ml2)
+lrtest(m_interaction_rs, mrs)
+lrtest(m_interaction2_rs,m_interaction_rs)
+
+#The likelihood ratio tests are statistically significant, implying that the
+#more complex model fits the data statistically significantly better than
+#the simpler model
+
+
+#see whether random slope makes sense 
+#yes: statistically significant
+#ranova(m_interaction_rs)
+```
+#dotplot
+```{r}
+library(lattice)
+dotplot_model<- dotplot(ranef(m_interaction_rs)) 
+dotplot_model
+```
+
+## interpreting income effects
+```{r}
+# Mean and SD of log-income
+mean_log_inc <- mean(pequiv_subset$log_eq_income, na.rm = TRUE)
+sd_log_inc   <- sd(pequiv_subset$log_eq_income, na.rm = TRUE)
+
+# A 1 SD increase means multiplying income by exp(sd_log_inc)
+
+income_multiplier <- exp(sd_log_inc)
+income_multiplier
+#1SD increase in log income corresponds with 93% increase in income
+
+#what happens when income doubles:
+
+delta_log = log(2)        
+delta_std = delta_log / sd_log_inc
+delta_std
+#Then multiply by your model coefficient:
+delta_happiness = 0.12 * delta_std
+delta_happiness
+#doubling income means 0.126 higher expected happiness
+```
+
+
+##variance explained by interaction (Proportional Reduction in Random Slope Variance (PRV))
+```{r}
+# Full variance-covariance matrix
+vc_mrs <- VarCorr(mrs)$pid
+vc_int <- VarCorr(m_interaction_rs)$pid
+
+# Extract random slope variances
+var_slope_A <- as.numeric(vc_mrs[2, 2])
+var_slope_B <- as.numeric(vc_int[2, 2])
+
+# Calculate proportional reduction
+prv_slope <- (var_slope_A - var_slope_B) / var_slope_A
+prv_slope
+
+((as.data.frame(VarCorr(mrs))[2,4])-(as.data.frame(VarCorr(m_interaction_rs))[2,4])) /
+(as.data.frame(VarCorr(mrs))[2,4])
+#1.4% of in between-person variance in the effect of employment on life satisfaction is explained by gender differences 
+
+```
+
+
+
+##Visualize
+```{r}
+library(emmeans)
+# Step 1: Get estimated marginal means
+emm1 <- emmeans(m_interaction_rs, ~ employmentstatus * female)
+
+# Step 2: Convert to data frame
+emm_df <- as.data.frame(emm1)
+emm_df
+
+# Step 3: Optional — relabel for clarity
+emm_df <- emm_df %>%
+  mutate(
+    employment = factor(employmentstatus, labels = c("Unemployed", "Employed")),
+    gender = factor(female, labels = c("Men", "Women"))
+  )
+
+# Step 4: Plot
+employmentplot <- ggplot(emm_df, aes(x = employment, y = emmean, color = gender)) +
+  geom_point(position = position_dodge(width = 0.15), size = 4) +  # thicker points
+  geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL),
+                position = position_dodge(width = 0.15),
+                width = 0.1, size = 1) +  # thicker CI bars
+  labs(
+    x = "Employment Status",
+    y = "Predicted Life Satisfaction",
+    color = "Gender",
+    title = "Predicted Life Satisfaction by Employment Status and Gender"
+  ) +
+  theme_minimal(base_size = 10) +  # smaller overall sizing
+  theme(
+    plot.title = element_text(size = 12),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 9),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9)
+  )
+
+employmentplot
+
+```
+
+
+##visualize life satisfaction for differing incomes
+```{r}
+##create a new grid with reasonable income values and predict life satisfaction for them
+###try with four different gender/employment cmbinations
+
+# Step 1: Create raw income range
+income_vals <- seq(10000, 200000, by = 10000)
+base_df <- expand.grid(
+  raw_income = income_vals,
+  employmentstatus = c(0, 1),
+  female = c(0, 1)
+)
+
+# Step 2: Log1p-transform income
+base_df$log_eq_income <- log1p(base_df$raw_income)
+
+# Step 3: Standardize log_hhincome
+mu <- mean(pequiv_subset$log_eq_income, na.rm = TRUE)
+sigma <- sd(pequiv_subset$log_eq_income, na.rm = TRUE)
+base_df$log_hhincome_scaled <- (base_df$log_eq_income - mu) / sigma
+
+# Step 4: Fill in average values for other covariates
+base_df <- base_df %>%
+  mutate(
+    health_lag = mean(pequiv_subset$health_lag, na.rm = TRUE),
+    baseyear = mean(pequiv_subset$baseyear, na.rm = TRUE),
+   married = mean(pequiv_subset$married, na.rm = TRUE)
+  )
+head(base_df)
+
+# Step 5: Predict happiness (fixed effects only)
+base_df$predicted_happiness <- predict(m_interaction_rs, newdata = base_df, re.form = NA)
+
+# Step 6: Label groups for plotting
+base_df <- base_df %>%
+  mutate(
+    group = case_when(
+      employmentstatus == 1 & female == 0 ~ "Employed Men",
+      employmentstatus == 1 & female == 1 ~ "Employed Women",
+      employmentstatus == 0 & female == 0 ~ "Unemployed Men",
+      employmentstatus == 0 & female == 1 ~ "Unemployed Women"
+    )
+  )
+
+# Step 7: Plot
+incomeplot <- ggplot(base_df, aes(x = raw_income, y = predicted_happiness, color = group)) +
+  geom_line(size = 1.2) +
+  labs(
+    x = "Adjusted Household Income (in Euro)",
+    y = "Predicted Life Satisfaction",
+    color = "Group",
+    title = "Predicted Life Satisfaction by Income, Gender, and Employment Status"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c(
+    "Employed Men" = "#1f77b4",
+    "Employed Women" = "#e377c2",
+    "Unemployed Men" = "#2ca02c",
+    "Unemployed Women" = "#d62728"
+  ))
+incomeplot
+
+```
+
+
+
+##checking explained variances
+```{r}
+# ml1a vs the null model
+#explained var at lvl 1 by key predictors
+1-((sigma(ml1a)^2/ (sigma(mnull)^2)))
+#explained var at lvl 2
+1-(as.numeric(VarCorr(ml1a)) / as.numeric(VarCorr(mnull)))
+
+
+# ml1 vs the null model
+#explained var at lvl 1
+1-((sigma(ml1)^2/ (sigma(mnull)^2)))
+#explained var at lvl 2
+1-(as.numeric(VarCorr(ml1)) / as.numeric(VarCorr(mnull)))
+
+
+#model_2 vs null model
+#explained var at lvl 1
+1-((sigma(ml2)^2/ (sigma(mnull)^2)))
+#explained var at lvl 2
+1-(as.numeric(VarCorr(ml2)) / as.numeric(VarCorr(mnull)))
+
+```
+
+
+
+
+```{r}
+
+
+#different table like in hox book
+#tab_model(
+#  mnull, ml1, ml2, mrs, m_interaction_rs,
+#  show.re.var = TRUE,       # Show random effects variances
+#  show.icc = TRUE,          # Show ICC
+#  show.aic = TRUE,          # Show AIC
+#  show.bic = TRUE,          # Show BIC
+#  dv.labels = c("M1: Null Model", "M2: L1 Predictors", "M3: +Gender", "M4: Random Slope", "M5: Interaction RS"),
+#  title = "Multilevel Models Predicting Happiness"
+#)
+
+
+
+
+```
+
+
+#MLM model assumptions
+```{r}
+model_interaction_rs <- m_interaction_rs
+
+#residuals level 1
+z_residuals_l1 <- resid(model_interaction_rs, type = "pearson", scale = T)
+
+#save as DF
+residuals_l1 <- data.frame(x = z_residuals_l1 )
+
+hist(residuals_l1$x)
+#not perectly normal distributed
+
+qqmath(model_interaction_rs)
+##deviations at the top and bottom
+
+
+
+```
+#Check whether the variance of the L1 residual errors is the same in all groups
+```{r}
+# Save the L1 residuals. let's add these as a variable to the dta
+pequiv_subset$l1resid<-residuals(model_interaction_rs)
+
+pequiv_subset$abs.l1resid<-abs(pequiv_subset$l1resid)
+# absolute value of residuals
+pequiv_subset$abs.l1resid2<-pequiv_subset$abs.l1resid^2
+# squared absolute value of the residuals
+Levene.Model.F <- lm(abs.l1resid2 ~ pid, data=pequiv_subset)
+#ANOVA of the squared residuals
+anova(Levene.Model.F) #displays the results
+
+##significantly different at 5% f-test
+
+```
+
+```{r}
+plot(model_interaction_rs, pid ~ resid(., scaled=TRUE))
+##slide deviation to the left
+
+plot(model_interaction_rs,
+     form = resid(., type = "pearson") ~ fitted(.), abline=0)
+##o check for failures of normality, nonlinearity, and heteroscedasticity. If these assumptions are met, the plotted points should be evenly divided above and below their mean value of zero. That is, there should be no relation between the variability around the zero-line and the fitted value (variability around the line should not be a function of the fitted values). 
+plot(model_interaction_rs, type = c("p", "smooth"))
+##smooth line is not horizontal but close enough
+```
+
+```{r}
+#l2 data
+l2_data <- pequiv_subset %>%
+  group_by(pid) %>% # group data by clustering variable, student
+  mutate(happiness_mean = mean(happiness)) %>% # create mean gpa per student
+  select(pid, happiness_mean, female) %>%
+  unique()
+
+
+head(l2_data)
+
+
+#residuals level 2
+l2_intercept_resid = ranef(model_interaction_rs)$pid [, 1]
+l2_slope_resid = ranef(model_interaction_rs)$pid[, 2]
+
+#plot histograms
+hist(l2_intercept_resid)
+
+hist(l2_slope_resid)
+
+#plot qq plots
+qqmath(l2_intercept_resid)
+
+qqmath(l2_slope_resid)
+###level 2 residuals also not perfectly normal distributed but closer to normal distribution. affects standard errors
+
+
+#add the lvl 2 residuals to lvl 2 data
+
+l2_data$intercept_resid <- l2_intercept_resid
+l2_data$slope_resid <- l2_slope_resid
+
+
+# merge level-2 data to predicted scores (these predicted scores are at the
+# l1-level)
+pequiv_subset_pred <-pequiv_subset %>% inner_join(l2_data[,], by = "pid" ,
+                                                  relationship="many-to-one")
+pequiv_subset_pred
+
+#add predicted scores
+pequiv_subset_pred$predlmer = predict(model_interaction_rs)
+
+
+pequiv_subset_pred %>%
+  ggplot(mapping = aes(x = predlmer, y = intercept_resid)) +
+  geom_point() +
+  labs(x = "predicted value", y = "L2 residuals intercept")
+
+
+pequiv_subset_pred %>%
+  ggplot(mapping = aes(x = predlmer, y = slope_resid)) +
+  geom_point() +
+  labs(x = "predicted value", y = "L2 residuals slope")
+
+# look at to figure out whether to standardize residuals
+# https://link.springer.com/article/10.3758/s13428-021-01709-z#Sec34
+#by Sara
+
+
+l2_data %>%
+  ggplot(mapping = aes(x = female, y = slope_resid)) +
+  geom_point() +
+  labs(x = "sex", y = "slope residuals")
+##gender and slope residuals not strongly correlated
+cor.test(l2_data$slope_resid, as.numeric(l2_data$female))
+# gender not correlated to random slope (employmentstatus)
+
+
+l2_data %>%
+  ggplot(mapping = aes(x = intercept_resid, y = slope_resid)) +
+  geom_point() +
+  labs(x = "employment", y = "residuals")
+#there seems to be a negative correlation between intercept and slope residuals
+cor.test(l2_data$slope_resid, as.numeric(l2_data$intercept_resid))
+#strong negative correlation. bad?
+
+# by including a covariance between intercept and slope variance we
+# account for a correlation between the intercept variance and slope variance! -> maybe need to do this?
+```
+
+
+
+
+
+
+# check for influential cases using leverage measures. use the function hlm_influence
+```{r}
+#doesnt work- too much CPU use
+#infl <- hlm_influence(model_interaction_rs, level = "pid")
+#print(infl, width = Inf)
+
+```
+
+
+
+
+
+
+##create variables to mark transitions to (un)-employment
+```{r}
+table(pequiv_subset$employmentstatus)
+attr(pequiv_subset$employmentstatus, "labels")
+
+
+pequiv_subset <- pequiv_subset %>%
+  arrange(pid, year) %>%
+  group_by(pid) %>%
+  mutate(
+    employmentstatus_lag = dplyr::lag(employmentstatus), 
+    emp_to_unemp = if_else(employmentstatus_lag == 1 & employmentstatus == 0, 1, 0, missing = NA_integer_),
+    unemp_to_emp = if_else(employmentstatus_lag == 0 & employmentstatus == 1, 1, 0, missing = NA_integer_)
+  ) %>%
+  ungroup()
+
+# Summary tables
+table(pequiv_subset$emp_to_unemp, useNA = "always")
+table(pequiv_subset$unemp_to_emp, useNA = "always")
+```
+
+#filter dataset for those who become unemployed
+```{r}
+ids_emp_to_unemp <- pequiv_subset %>%
+  filter(emp_to_unemp == 1) %>%
+  distinct(pid)
+
+employment_df <- pequiv_subset %>%
+  filter(pid %in% ids_emp_to_unemp$pid)
+
+length(unique(employment_df$pid))
+
+
+```
+
+##plot happiness time to transitioning from emp to unemp
+```{r}
+
+# Step 1: Identify transitions from employment to unemployment
+transition_years <- pequiv_subset %>%
+  filter(emp_to_unemp == 1) %>%
+  select(pid, transition_year = year)
+
+# Step 2: Identify control group (never transitioned)
+control_ids <- pequiv_subset %>%
+  anti_join(transition_years, by = "pid") %>%
+  distinct(pid)
+
+# Step 3: Assign "fake" transition year to control group (median year per person)
+control_fake_transition <- pequiv_subset %>%
+  filter(pid %in% control_ids$pid) %>%
+  group_by(pid) %>%
+  summarise(transition_year = floor(median(year, na.rm = TRUE)))
+
+# Step 4: Create treated group with relative year
+treated_traj <- pequiv_subset %>%
+  inner_join(transition_years, by = "pid") %>%
+  mutate(
+    relative_year = year - transition_year,
+    group = "Transitioned"
+  ) %>%
+  filter(relative_year %in% -5:5)
+
+# Step 5: Create control group with relative year
+control_traj <- pequiv_subset %>%
+  inner_join(control_fake_transition, by = "pid") %>%
+  mutate(
+    relative_year = year - transition_year,
+    group = "Control"
+  ) %>%
+  filter(relative_year %in% -5:5)
+
+# Step 6: Combine and summarize with confidence intervals
+happiness_compare <- bind_rows(treated_traj, control_traj) %>%
+  group_by(group, relative_year) %>%
+  summarise(
+    mean_happiness = mean(happiness, na.rm = TRUE),
+    sd = sd(happiness, na.rm = TRUE),
+    n = sum(!is.na(happiness)),
+    se = sd / sqrt(n),
+    ci_lower = mean_happiness - 1.96 * se,
+    ci_upper = mean_happiness + 1.96 * se,
+    .groups = "drop"
+  )
+
+# Step 7: Plot
+ggplot(happiness_compare, aes(x = relative_year, y = mean_happiness, color = group, fill = group)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.2, color = NA) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    title = "Average Happiness Around Employment → Unemployment Transition",
+    x = "Years Relative to Transition",
+    y = "Average Happiness",
+    color = "Group",
+    fill = "Group"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+```{r}
+# Summarize transition group happiness trajectory with CIs
+happiness_transitions_only <- treated_traj %>%
+  group_by(relative_year) %>%
+  summarise(
+    mean_happiness = mean(happiness, na.rm = TRUE),
+    sd = sd(happiness, na.rm = TRUE),
+    n = sum(!is.na(happiness)),
+    se = sd / sqrt(n),
+    ci_lower = mean_happiness - 1.96 * se,
+    ci_upper = mean_happiness + 1.96 * se,
+    .groups = "drop"
+  )
+
+# Plot
+ggplot(happiness_transitions_only, aes(x = relative_year, y = mean_happiness)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.2, fill = "steelblue") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    title = "Average Happiness Around Employment → Unemployment Transition",
+    x = "Years Relative to Transition",
+    y = "Average Happiness"
+  ) +
+  theme_minimal()
+
+```
+##separately for men and women
+```{r}
+# Step 1: Label gender using `female` variable
+treated_traj <- treated_traj %>%
+  mutate(
+    gender_label = if_else(female == 1, "Women", "Men")
+  )
+
+# Step 2: Summarize happiness by gender and relative year
+happiness_by_gender <- treated_traj %>%
+  group_by(gender_label, relative_year) %>%
+  summarise(
+    mean_happiness = mean(happiness, na.rm = TRUE),
+    sd = sd(happiness, na.rm = TRUE),
+    n = sum(!is.na(happiness)),
+    se = sd / sqrt(n),
+    ci_lower = mean_happiness - 1.96 * se,
+    ci_upper = mean_happiness + 1.96 * se,
+    .groups = "drop"
+  )
+
+# Step 3: Plot
+ggplot(happiness_by_gender, aes(x = relative_year, y = mean_happiness, color = gender_label, fill = gender_label)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.2, color = NA) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    title = "Happiness Around Employment → Unemployment Transition, by Gender",
+    x = "Years Relative to Transition",
+    y = "Average Happiness",
+    color = "Gender",
+    fill = "Gender"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+
+
+
+
